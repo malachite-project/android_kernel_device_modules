@@ -1263,6 +1263,25 @@ static struct LCM_setting_table lcm_peak_mode_on[] = {
 	{0xFD, 0x02,{0xA5,0xA5}},
 };
 static unsigned int peak_mode_enable = 0;
+
+/*
+ * Queue a command table on the backlight packet. The backlight path
+ * (mtk_drm_setbacklight) already holds mtk_crtc->lock, which
+ * mi_disp_panel_ddic_send_cmd() takes again, so sending the peak-mode
+ * tables with it deadlocks the display.
+ */
+static void lcm_peak_mode_send_gce(void *dsi, dcs_write_gce cb, void *handle,
+				   struct LCM_setting_table *table, unsigned int count)
+{
+	unsigned char buf[ARRAY_SIZE(table->para_list) + 1];
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		buf[0] = table[i].cmd;
+		memcpy(&buf[1], table[i].para_list, table[i].count);
+		cb(dsi, handle, buf, table[i].count + 1);
+	}
+}
 static int lcm_setbacklight_cmdq(void *dsi, dcs_write_gce cb, void *handle,
 				 unsigned int level)
 {
@@ -1289,13 +1308,13 @@ static int lcm_setbacklight_cmdq(void *dsi, dcs_write_gce cb, void *handle,
 
 	pr_info("%s: level %d = 0x%02X, 0x%02X\n", __func__, level, bl_tb0[1], bl_tb0[2]);
 	if (level == PEAK_ON_BL && !peak_mode_enable) {
-		mi_disp_panel_ddic_send_cmd(lcm_peak_mode_on, ARRAY_SIZE(lcm_peak_mode_on), false);
+		lcm_peak_mode_send_gce(dsi, cb, handle, lcm_peak_mode_on, ARRAY_SIZE(lcm_peak_mode_on));
 		peak_mode_enable = 1;
 		goto peak_on;
 	} else if (peak_mode_enable && level < PEAK_ON_BL) {
 		lcm_peak_mode_off[7].para_list[0] = bl_tb0[1];
 		lcm_peak_mode_off[7].para_list[1] = bl_tb0[2];
-		mi_disp_panel_ddic_send_cmd(lcm_peak_mode_off, ARRAY_SIZE(lcm_peak_mode_off), false);
+		lcm_peak_mode_send_gce(dsi, cb, handle, lcm_peak_mode_off, ARRAY_SIZE(lcm_peak_mode_off));
 		peak_mode_enable = 0;
 		goto peak_on;
 	}
