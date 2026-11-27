@@ -388,6 +388,21 @@ static ssize_t goodix_ts_chip_info_show(struct device  *dev,
 	return cnt;
 }
 
+/*
+ * The IC falls back to its default 240Hz report rate whenever it is reset
+ * or power cycled. Send the selected rate again, but only in normal mode:
+ * a sleeping or gesture mode IC must not get the command.
+ */
+static void goodix_ts_restore_report_rate(struct goodix_ts_core *cd)
+{
+	if (cd->report_rate != 480)
+		return;
+	if (atomic_read(&cd->suspended) || cd->work_status != TP_NORMAL)
+		return;
+	if (cd->hw_ops->switch_report_rate(cd, true))
+		ts_err("failed to restore 480HZ report rate");
+}
+
 /* reset chip */
 static ssize_t goodix_ts_reset_store(struct device *dev,
 				     struct device_attribute *attr,
@@ -399,8 +414,9 @@ static ssize_t goodix_ts_reset_store(struct device *dev,
 
 	if (!buf || count <= 0)
 		return -EINVAL;
-	if (buf[0] != '0')
-		hw_ops->reset(core_data, GOODIX_NORMAL_RESET_DELAY_MS);
+	if (buf[0] != '0' &&
+	    !hw_ops->reset(core_data, GOODIX_NORMAL_RESET_DELAY_MS))
+		goodix_ts_restore_report_rate(core_data);
 	return count;
 }
 
@@ -916,16 +932,25 @@ static ssize_t goodix_ts_report_rate_store(struct device *dev,
 					const char *buf, size_t count)
 {
 	struct goodix_ts_core *core_data = dev_get_drvdata(dev);
+	int old_rate = core_data->report_rate;
+	bool high;
+	int ret;
 
 	if (!buf || count <= 0)
 		return -EINVAL;
 
-	if (buf[0] != '0') {
-		goodix_core_data->report_rate = 480;
-		core_data->hw_ops->switch_report_rate(core_data, true);
-	} else {
-		goodix_core_data->report_rate = 240;
-		core_data->hw_ops->switch_report_rate(core_data, false);
+	high = buf[0] != '0';
+	core_data->report_rate = high ? 480 : 240;
+
+	/* Asleep or in gesture mode: resume applies the rate. */
+	if (atomic_read(&core_data->suspended) ||
+	    core_data->work_status != TP_NORMAL)
+		return count;
+
+	ret = core_data->hw_ops->switch_report_rate(core_data, high);
+	if (ret) {
+		core_data->report_rate = old_rate;
+		return ret;
 	}
 	return count;
 }
@@ -1502,9 +1527,11 @@ static int goodix_ts_request_handle(struct goodix_ts_core *cd,
 
 	if (ts_event->request_code == REQUEST_TYPE_CONFIG)
 		ret = goodix_send_ic_config(cd, CONFIG_TYPE_NORMAL);
-	else if (ts_event->request_code == REQUEST_TYPE_RESET)
+	else if (ts_event->request_code == REQUEST_TYPE_RESET) {
 		ret = hw_ops->reset(cd, GOODIX_NORMAL_RESET_DELAY_MS);
-	else
+		if (!ret)
+			goodix_ts_restore_report_rate(cd);
+	} else
 		ts_info("can not handle request type 0x%x",
 			  ts_event->request_code);
 	if (ret)
@@ -2001,7 +2028,8 @@ static void goodix_ts_esd_work(struct work_struct *work)
 	if (ret) {
 		ts_err("esd check failed");
 		goodix_ts_power_off(cd);
-		goodix_ts_power_on(cd);
+		if (!goodix_ts_power_on(cd))
+			goodix_ts_restore_report_rate(cd);
 	}
 
 exit:
@@ -2316,6 +2344,8 @@ out:
 	/* enable palm sensor */
 	if (core_data->palm_status)
 		ret = hw_ops->palm_on(core_data, core_data->palm_status);
+
+	goodix_ts_restore_report_rate(core_data);
 
 	/* enable irq */
 	hw_ops->irq_enable(core_data, true);
